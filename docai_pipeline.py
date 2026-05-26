@@ -4,9 +4,10 @@ import time
 import logging
 import re
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from azure.core.credentials import AzureKeyCredential
@@ -26,6 +27,9 @@ INTEL_OUTPUT_DIR = os.getenv("DOCAI_INTEL_OUTPUT_DIR", "./intel_output")
 CLEAN_LABELED_DIR = os.getenv("DOCAI_CLEAN_LABELED_DIR", "./clean_labeled_data")
 EXCEL_OUTPUT_DIR = os.getenv("DOCAI_EXCEL_OUTPUT_DIR", "./excel_output")
 EXCEL_FILENAME = os.getenv("DOCAI_EXCEL_FILENAME", "licenses.xlsx")
+RUNS_DIR = os.getenv("DOCAI_RUNS_DIR", "./runs")
+
+MAX_WORKERS = int(os.getenv("DOCAI_MAX_WORKERS", "4"))
 
 # Identifier field used to join array sheets back to main rows.
 # Set DOCAI_ID_FIELD to the exact label in your model (e.g. "License Number").
@@ -117,7 +121,48 @@ def save_raw_output(result: dict, source_filename: str, output_dir: Path) -> Pat
     return out_path
 
 
-def run_stage_1(force: bool = False) -> list[Path]:
+def _process_one_pdf(client: DocumentIntelligenceClient,
+                     file_path: Path,
+                     output_path: Path,
+                     force: bool) -> dict:
+    """Process a single PDF. Returns a manifest record."""
+    record: dict[str, Any] = {
+        "source": file_path.name,
+        "size_bytes": file_path.stat().st_size,
+        "status": "ok",
+        "raw_path": None,
+        "duration_s": 0.0,
+        "error": None,
+    }
+
+    expected_raw = output_path / (file_path.stem + "_raw.json")
+    if expected_raw.exists() and not force:
+        log.info("Skipping %s — raw output already exists (use --force to re-run)",
+                 file_path.name)
+        record["status"] = "skipped"
+        record["raw_path"] = str(expected_raw)
+        return record
+
+    started = time.monotonic()
+    try:
+        result = analyze_pdf(client, file_path)
+        if result is None:
+            record["status"] = "too_large"
+        else:
+            rp = save_raw_output(result, file_path.name, output_path)
+            record["raw_path"] = str(rp)
+    except Exception as e:
+        log.exception("Failed to analyze %s", file_path.name)
+        record["status"] = "failed"
+        record["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        record["duration_s"] = round(time.monotonic() - started, 2)
+
+    return record
+
+
+def run_stage_1(force: bool = False,
+                manifest: Optional[dict] = None) -> list[Path]:
     input_path = Path(INPUT_DIR)
     output_path = Path(INTEL_OUTPUT_DIR)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -129,33 +174,41 @@ def run_stage_1(force: bool = False) -> list[Path]:
 
     if not files:
         log.warning("No PDF files found in %s", input_path)
+        if manifest is not None:
+            manifest["stage_1"] = {"files": [], "workers": MAX_WORKERS}
         return []
 
-    log.info("Found %d PDF(s) in %s", len(files), input_path)
+    log.info("Found %d PDF(s) in %s — analyzing with %d worker(s)",
+             len(files), input_path, MAX_WORKERS)
 
     client = get_di_client()
-    raw_paths: list[Path] = []
-    skipped = 0
+    records: list[dict] = []
 
-    for file_path in files:
-        expected_raw = output_path / (file_path.stem + "_raw.json")
-        if expected_raw.exists() and not force:
-            log.info("Skipping %s — raw output already exists (use --force to re-run)",
-                     file_path.name)
-            raw_paths.append(expected_raw)
-            skipped += 1
-            continue
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        future_to_file = {
+            pool.submit(_process_one_pdf, client, fp, output_path, force): fp
+            for fp in files
+        }
+        for fut in as_completed(future_to_file):
+            records.append(fut.result())
 
-        try:
-            result = analyze_pdf(client, file_path)
-            if result:
-                rp = save_raw_output(result, file_path.name, output_path)
-                raw_paths.append(rp)
-        except Exception:
-            log.exception("Failed to analyze %s", file_path.name)
+    records.sort(key=lambda r: r["source"])
 
-    log.info("Stage 1 complete — %d raw file(s) available (%d skipped, %d newly analyzed).",
-             len(raw_paths), skipped, len(raw_paths) - skipped)
+    raw_paths = [Path(r["raw_path"]) for r in records if r["raw_path"]]
+    counts = {"ok": 0, "skipped": 0, "failed": 0, "too_large": 0}
+    for r in records:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+
+    log.info("Stage 1 complete — ok=%d skipped=%d failed=%d too_large=%d",
+             counts["ok"], counts["skipped"], counts["failed"], counts["too_large"])
+
+    if manifest is not None:
+        manifest["stage_1"] = {
+            "workers": MAX_WORKERS,
+            "counts": counts,
+            "files": records,
+        }
+
     return raw_paths
 
 
@@ -276,7 +329,8 @@ def clean_raw_file(raw_path: Path, output_dir: Path) -> Path:
     return out_path
 
 
-def run_stage_2(raw_paths: Optional[list[Path]] = None) -> list[Path]:
+def run_stage_2(raw_paths: Optional[list[Path]] = None,
+                manifest: Optional[dict] = None) -> list[Path]:
     intel_path = Path(INTEL_OUTPUT_DIR)
     clean_path = Path(CLEAN_LABELED_DIR)
     clean_path.mkdir(parents=True, exist_ok=True)
@@ -286,18 +340,31 @@ def run_stage_2(raw_paths: Optional[list[Path]] = None) -> list[Path]:
 
     if not raw_paths:
         log.warning("No raw output files found in %s", intel_path)
+        if manifest is not None:
+            manifest["stage_2"] = {"files": []}
         return []
 
     log.info("Cleaning %d raw file(s)…", len(raw_paths))
     clean_paths = []
+    records: list[dict] = []
     for rp in raw_paths:
+        rec: dict[str, Any] = {"source": rp.name, "status": "ok",
+                               "clean_path": None, "error": None}
         try:
             cp = clean_raw_file(rp, clean_path)
             clean_paths.append(cp)
-        except Exception:
+            rec["clean_path"] = str(cp)
+        except Exception as e:
             log.exception("Failed to clean %s", rp.name)
+            rec["status"] = "failed"
+            rec["error"] = f"{type(e).__name__}: {e}"
+        records.append(rec)
 
     log.info("Stage 2 complete — %d clean file(s) written.", len(clean_paths))
+
+    if manifest is not None:
+        manifest["stage_2"] = {"files": records}
+
     return clean_paths
 
 
@@ -329,7 +396,8 @@ def _write_sheet(ws, rows: list[dict], priority: list[str]) -> None:
     autosize_columns(ws)
 
 
-def run_stage_3(clean_paths: Optional[list[Path]] = None) -> Optional[Path]:
+def run_stage_3(clean_paths: Optional[list[Path]] = None,
+                manifest: Optional[dict] = None) -> Optional[Path]:
     clean_dir = Path(CLEAN_LABELED_DIR)
     excel_dir = Path(EXCEL_OUTPUT_DIR)
     excel_dir.mkdir(parents=True, exist_ok=True)
@@ -415,6 +483,25 @@ def run_stage_3(clean_paths: Optional[list[Path]] = None) -> Optional[Path]:
     log.info("Stage 3 complete — workbook: %s  (%d main row(s), %d array sheet(s))",
              out_path, len(main_rows), len(array_tables))
     log.info("  Joining on field: %r → column 'id_value'", ID_FIELD)
+
+    if manifest is not None:
+        manifest["stage_3"] = {
+            "workbook": str(out_path),
+            "main_rows": len(main_rows),
+            "array_sheets": {name: len(rows) for name, rows in array_tables.items()},
+            "id_field": ID_FIELD,
+        }
+
+    return out_path
+
+
+def write_manifest(manifest: dict) -> Path:
+    runs_dir = Path(RUNS_DIR)
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    out_path = runs_dir / f"{manifest['run_id']}.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, default=str)
+    log.info("Run manifest: %s", out_path)
     return out_path
 
 
@@ -440,41 +527,69 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    started_at = datetime.now(timezone.utc)
+    run_id = started_at.strftime("%Y%m%dT%H%M%SZ")
+    manifest: dict[str, Any] = {
+        "run_id": run_id,
+        "started_at": started_at.isoformat(),
+        "finished_at": None,
+        "stages_run": [],
+        "args": {"stage": args.stage, "force": args.force},
+        "config": {
+            "model_id": MODEL_ID,
+            "max_workers": MAX_WORKERS,
+            "max_retries": MAX_RETRIES,
+            "id_field": ID_FIELD,
+        },
+    }
+
     log.info("=" * 60)
-    log.info("Azure Document Intelligence Pipeline — stage=%s force=%s",
-             args.stage, args.force)
+    log.info("Azure Document Intelligence Pipeline — run_id=%s stage=%s force=%s",
+             run_id, args.stage, args.force)
     log.info("=" * 60)
 
     raw_paths = None
     clean_paths = None
 
-    if args.stage in ("1", "all"):
-        input_path = Path(INPUT_DIR)
-        if not input_path.is_dir():
-            log.error("Input directory does not exist: %s", input_path)
-            return
-        log.info("-" * 40)
-        log.info("STAGE 1: Azure Document Intelligence")
-        log.info("-" * 40)
-        raw_paths = run_stage_1(force=args.force)
+    try:
+        if args.stage in ("1", "all"):
+            input_path = Path(INPUT_DIR)
+            if not input_path.is_dir():
+                log.error("Input directory does not exist: %s", input_path)
+                return
+            log.info("-" * 40)
+            log.info("STAGE 1: Azure Document Intelligence")
+            log.info("-" * 40)
+            manifest["stages_run"].append("1")
+            raw_paths = run_stage_1(force=args.force, manifest=manifest)
 
-    if args.stage in ("2", "all"):
-        log.info("-" * 40)
-        log.info("STAGE 2: Clean & Label")
-        log.info("-" * 40)
-        clean_paths = run_stage_2(raw_paths)
+        if args.stage in ("2", "all"):
+            log.info("-" * 40)
+            log.info("STAGE 2: Clean & Label")
+            log.info("-" * 40)
+            manifest["stages_run"].append("2")
+            clean_paths = run_stage_2(raw_paths, manifest=manifest)
 
-    if args.stage in ("3", "all"):
-        log.info("-" * 40)
-        log.info("STAGE 3: Aggregate to Excel")
-        log.info("-" * 40)
-        run_stage_3(clean_paths)
+        if args.stage in ("3", "all"):
+            log.info("-" * 40)
+            log.info("STAGE 3: Aggregate to Excel")
+            log.info("-" * 40)
+            manifest["stages_run"].append("3")
+            run_stage_3(clean_paths, manifest=manifest)
+    finally:
+        finished_at = datetime.now(timezone.utc)
+        manifest["finished_at"] = finished_at.isoformat()
+        manifest["duration_s"] = round(
+            (finished_at - started_at).total_seconds(), 2
+        )
+        write_manifest(manifest)
 
     log.info("=" * 60)
     log.info("Pipeline complete!")
     log.info("  Raw output:    %s", INTEL_OUTPUT_DIR)
     log.info("  Clean labeled: %s", CLEAN_LABELED_DIR)
     log.info("  Excel output:  %s", EXCEL_OUTPUT_DIR)
+    log.info("  Run manifest:  %s/", RUNS_DIR)
     log.info("=" * 60)
 
 

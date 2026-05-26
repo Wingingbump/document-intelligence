@@ -17,6 +17,7 @@ intel_output/
 clean_labeled_data/
 excel_output/
 csv_outputs/
+runs/
 
 # IDE
 .vscode/
