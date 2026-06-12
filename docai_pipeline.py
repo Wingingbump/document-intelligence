@@ -213,11 +213,40 @@ def run_stage_1(force: bool = False,
 
 
 # STAGE 2 — Clean raw JSON into human-readable, labeled JSON
+# Azure DI stores typed values under per-type keys (valueString, valueNumber…),
+# not a generic "value" key. Map field type → the key carrying the parsed value.
+TYPED_VALUE_KEYS = {
+    "string": "valueString",
+    "phoneNumber": "valuePhoneNumber",
+    "countryRegion": "valueCountryRegion",
+    "number": "valueNumber",
+    "integer": "valueInteger",
+    "date": "valueDate",
+    "time": "valueTime",
+    "selectionMark": "valueSelectionMark",
+    "boolean": "valueBoolean",
+    "currency": "valueCurrency",
+    "address": "valueAddress",
+    "signature": "valueSignature",
+    "array": "valueArray",
+    "object": "valueObject",
+}
+
+
+def get_typed_value(field: dict, field_type: str):
+    """Return the parsed value for a field, checking the typed key first."""
+    key = TYPED_VALUE_KEYS.get(field_type)
+    if key and key in field:
+        return field[key]
+    # Fall back to a generic "value" key for older response shapes.
+    return field.get("value")
+
+
 def extract_field_value(field: dict) -> dict:
     field_type = field.get("type", "string")
     content = field.get("content", "")
     confidence = field.get("confidence", 0.0)
-    value = field.get("value")
+    value = get_typed_value(field, field_type)
 
     extracted = {
         "type": field_type,
@@ -232,7 +261,7 @@ def extract_field_value(field: dict) -> dict:
     elif field_type in ("date", "time") and value is not None:
         extracted["value"] = str(value)
     elif field_type == "selectionMark":
-        extracted["value"] = field.get("value", "")
+        extracted["value"] = value if value is not None else ""
     elif field_type == "currency" and isinstance(value, dict):
         extracted["value"] = value.get("amount")
         extracted["currency_code"] = value.get("currencyCode", "")
@@ -258,7 +287,8 @@ def extract_field_value(field: dict) -> dict:
                     if isinstance(sub_field, dict):
                         item_fields[sub_name] = extract_field_value(sub_field)
             else:
-                item_fields["value"] = item.get("content")
+                item_value = get_typed_value(item, item.get("type", "string"))
+                item_fields["value"] = item_value if item_value is not None else item.get("content")
             extracted["items"].append({"index": i, "fields": item_fields})
     elif field_type == "object" and isinstance(value, dict):
         extracted["value"] = content
